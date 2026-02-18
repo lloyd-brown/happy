@@ -1,6 +1,7 @@
 import { onShutdown } from "@/utils/shutdown";
 import { Fastify } from "./types";
-import { buildMachineActivityEphemeral, ClientConnection, eventRouter } from "@/app/events/eventRouter";
+import { buildMachineActivityEphemeral, buildSessionActivityEphemeral, ClientConnection, eventRouter } from "@/app/events/eventRouter";
+import { db } from "@/storage/db";
 import { Server, Socket } from "socket.io";
 import { log } from "@/utils/log";
 import { auth } from "@/app/auth/auth";
@@ -119,6 +120,27 @@ export function startSocket(app: Fastify) {
             decrementWebSocketConnection(connection.connectionType);
 
             log({ module: 'websocket' }, `User disconnected: ${userId}`);
+
+            // Mark session inactive immediately when session-scoped socket disconnects
+            if (connection.connectionType === 'session-scoped') {
+                const sid = connection.sessionId;
+                const now = Date.now();
+                db.session.updateMany({
+                    where: { id: sid, active: true },
+                    data: { active: false, lastActiveAt: new Date(now) }
+                }).then((result) => {
+                    if (result.count > 0) {
+                        log({ module: 'websocket' }, `Marked session ${sid} inactive on disconnect`);
+                        eventRouter.emitEphemeral({
+                            userId,
+                            payload: buildSessionActivityEphemeral(sid, false, now, false),
+                            recipientFilter: { type: 'user-scoped-only' }
+                        });
+                    }
+                }).catch((error) => {
+                    log({ module: 'websocket', level: 'error' }, `Error marking session inactive on disconnect: ${error}`);
+                });
+            }
 
             // Broadcast daemon offline status
             if (connection.connectionType === 'machine-scoped') {
